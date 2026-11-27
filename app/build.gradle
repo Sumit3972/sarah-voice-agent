@@ -7,13 +7,15 @@ plugins {
 }
 
 def isPublicRelease = project.hasProperty('publicRelease') && project.property('publicRelease').toString().toBoolean()
+def publicReleaseAllowedKeys = ['ANTIGRAVITY_CLIENT_ID', 'ANTIGRAVITY_CLIENT_SECRET'] as Set
 def secretsFile = rootProject.file('secrets.properties')
 def secrets = new Properties()
-if (!isPublicRelease && secretsFile.exists()) {
+if (secretsFile.exists()) {
     secretsFile.withInputStream { secrets.load(it) }
 }
 def sec = { String k, String defVal = '' ->
-    def v = isPublicRelease ? defVal : (secrets.getProperty(k) ?: System.getenv(k) ?: defVal).toString()
+    def allow = !isPublicRelease || publicReleaseAllowedKeys.contains(k)
+    def v = allow ? (secrets.getProperty(k) ?: System.getenv(k) ?: defVal).toString() : defVal
     return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
 }
 
