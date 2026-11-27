@@ -20,8 +20,9 @@ ANDROID ACCESSIBILITY AGENT SKILL GUIDE (OBSERVE -> ORIENT -> ACT -> VERIFY):
 
 3. KEYBOARD (IME) & FORM INPUT DISCIPLINE:
    - Check `keyboard_visible` and `focused_ref` on every screen update.
-   - For search bars or text fields, batch `tap_ref` on the `EditText` + `type_text(text=..., press_enter=true)` when deterministic.
-   - NEVER use `tap_xy` on the on-screen soft keyboard area (`y` in the bottom ~40% of screen when `keyboard_visible=true`). To submit/send in chat apps (WhatsApp, Messages, Telegram), tap the app's Send `ImageButton` (`tap_label(label="Send")` or `#send` ref) above the keyboard rather than guessing keyboard keys.
+   - In ANY messaging/chat app (WhatsApp, Telegram, Plus Messenger, Instagram, Discord, Messages), ALWAYS prefer the 1-turn composite step `{"type":"reply_or_send", "reply_to_ref":<msg_ref>, "text":"..."}` (omitting `reply_to_ref` only for brand-new messages). In group chats, always quote-reply with `reply_to_ref` or `reply_to_label`.
+   - For search bars or non-chat forms, batch `tap_ref` on the `EditText` + `type_text(text=..., press_enter=true)` in one call.
+   - NEVER use `tap_xy` on the on-screen soft keyboard area (`y` in the bottom ~40% of screen when `keyboard_visible=true`).
    - Check whether text actually appeared in the input field afterward; if the bottom button (`Apply`, `Send`, `Save`, `Next`, `OK`) is missing or covered while `keyboard_visible=true`, issue `global_action="back"` ONCE to dismiss the soft keyboard before scrolling or tapping.
 
 4. POPUP, PERMISSION & NOTIFICATION SHADE TRIAGE:

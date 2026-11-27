@@ -32,6 +32,11 @@ class StreamingLlmRouter(
         antigravityProvider.cancelActive()
     }
 
+    fun cancelAllCalls() {
+        mercuryProvider.cancelAllCalls()
+        antigravityProvider.cancelAllCalls()
+    }
+
     suspend fun generateDynamicAck(userUtterance: String, activePackage: String): String? {
         return mercuryProvider.generateDynamicAck(userUtterance, activePackage)
     }

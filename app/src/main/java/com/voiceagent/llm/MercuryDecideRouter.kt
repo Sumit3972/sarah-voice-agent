@@ -143,6 +143,7 @@ class MercuryDecideRouter {
             }
             if (bundle == "autonomous_automation" ||
                 "autonomous_task" in mergedTools ||
+                "swarm_dispatch" in mergedTools ||
                 "shizuku_shell" in mergedTools ||
                 "notification_center" in mergedTools ||
                 isLockscreenToolTurn
@@ -583,7 +584,7 @@ class MercuryDecideRouter {
                 listOf("device_intent")
             }
             "contacts_and_device" -> listOf("personal_scheduler", "device_intent", "observe_screen", "ui_act")
-            "autonomous_automation" -> listOf("autonomous_task", "personal_scheduler", "notification_center", "device_intent")
+            "autonomous_automation" -> listOf("autonomous_task", "swarm_dispatch", "personal_scheduler", "notification_center", "device_intent")
             "screen_automation" -> listOf("observe_screen", "ui_act", "device_intent", "shizuku_shell")
             "notification_ops" -> listOf("notification_center", "observe_screen", "ui_act", "device_status")
             "live_info_lookup" -> listOf("live_info")
@@ -611,6 +612,9 @@ class MercuryDecideRouter {
         }
         if (Regex("\\b(on behalf of me|until i say stop|keep chatting|auto[- ]?reply|chat with .* on behalf|every \\d+ (min|minute|minutes|hour|hours)|watch for|monitor .* every|wake up (at|in)|background tasks?|background loops?|autonomous|stop chatting|stop all tasks?|stop watching|pause tasks?|resume tasks?|list tasks?)\\b").containsMatchIn(lower)) {
             out += "autonomous_task"
+        }
+        if (Regex("\\b(swarm|parallel|simultaneously|at the same time|in parallel|all at once|multiple workers)\\b").containsMatchIn(lower)) {
+            out += "swarm_dispatch"
         }
         if (Regex("\\b(notification|notifications|unread|who messaged|reply to|dismiss notification|otp|verification code|passcode|code from)\\b").containsMatchIn(lower)) {
             out += "notification_center"

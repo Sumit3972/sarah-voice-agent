@@ -19,6 +19,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 data class AccountSummary(
     val email: String,
@@ -40,7 +41,8 @@ data class AccountState(
     var claudeCooldownUntilMs: Long = 0L,
     var geminiQuotaFraction: Double = 0.9,
     var claudeQuotaFraction: Double = 1.0,
-    val mutex: Mutex = Mutex()
+    val mutex: Mutex = Mutex(),
+    val inFlightCount: AtomicInteger = AtomicInteger(0)
 ) {
     fun isOnCooldown(taskType: String): Boolean {
         val now = System.currentTimeMillis()
@@ -149,16 +151,28 @@ class OAuthAccountPool {
             available = accounts.toMutableList()
         }
 
-        available.sortByDescending {
-            if (taskType == "claude") it.claudeQuotaFraction else it.geminiQuotaFraction
-        }
+        available.sortWith(
+            compareBy<AccountState> { it.inFlightCount.get() }
+                .thenByDescending {
+                    if (taskType == "claude") it.claudeQuotaFraction else it.geminiQuotaFraction
+                }
+        )
 
         val count = available.size
-        val startIdx = (roundRobin++ and Int.MAX_VALUE) % count
+        val startIdx = if (count > 1 && available.all { it.inFlightCount.get() == available.first().inFlightCount.get() }) {
+            (roundRobin++ and Int.MAX_VALUE) % count
+        } else {
+            0
+        }
         List(count) { offset ->
             available[(startIdx + offset) % count]
         }
     }
+
+    fun incrementInFlight(acc: AccountState): Int = acc.inFlightCount.incrementAndGet()
+
+    fun decrementInFlight(acc: AccountState): Int =
+        acc.inFlightCount.updateAndGet { cur -> (cur - 1).coerceAtLeast(0) }
 
     suspend fun getAccessToken(acc: AccountState): String = acc.mutex.withLock {
         val now = System.currentTimeMillis()
@@ -197,43 +211,57 @@ class OAuthAccountPool {
         }
     }
 
-    suspend fun getProjectId(acc: AccountState, token: String): String {
-        return withContext(Dispatchers.IO) {
-            val bodyJson = """{"metadata":{"ideType":"ANTIGRAVITY"}}"""
-            for (ep in listOf(BASE_URL_DAILY, BASE_URL_SANDBOX, BASE_URL_PROD)) {
-                val req = Request.Builder()
-                    .url("$ep:loadCodeAssist")
-                    .addHeader("Authorization", "Bearer $token")
-                    .addHeader("User-Agent", USER_AGENT)
-                    .addHeader("Content-Type", "application/json")
-                    .post(bodyJson.toRequestBody("application/json".toMediaType()))
-                    .build()
+    suspend fun getProjectId(
+        acc: AccountState,
+        token: String,
+        forceRefresh: Boolean = false
+    ): String {
+        val cached = acc.mutex.withLock {
+            if (!forceRefresh && acc.projectId.isNotBlank()) acc.projectId else ""
+        }
+        if (cached.isNotBlank()) return cached
 
-                val outcome = runCatching {
-                    httpClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use null
-                        val obj = json.parseToJsonElement(resp.body.string()).jsonObject
-                        val pid = obj["cloudaicompanionProject"]?.asStrOrNull().orEmpty()
-                        val paidId = obj["paidTier"]?.let { runCatching { it.jsonObject }.getOrNull() }
-                            ?.let { it["id"].asStrOrNull() ?: it["name"].asStrOrNull() }
-                        val curId = obj["currentTier"]?.let { runCatching { it.jsonObject }.getOrNull() }
-                            ?.let { it["id"].asStrOrNull() ?: it["name"].asStrOrNull() }
-                        val resolvedTier = normalizeTierLabel(paidId ?: curId ?: "free-tier")
-                        pid to resolvedTier
-                    }
-                }.getOrNull()
-
-                if (outcome != null) {
-                    var (pid, tier) = outcome
-                    if (pid.isBlank()) {
-                        pid = tryOnboardFreeTier(token)
-                    }
-                    acc.tierLabel = tier
-                    if (pid.isNotBlank()) acc.projectId = pid
-                    return@withContext acc.projectId
-                }
+        return acc.mutex.withLock {
+            if (!forceRefresh && acc.projectId.isNotBlank()) {
+                return@withLock acc.projectId
             }
-            acc.projectId.ifBlank { "aicode-consumers" }
+            withContext(Dispatchers.IO) {
+                val bodyJson = """{"metadata":{"ideType":"ANTIGRAVITY"}}"""
+                for (ep in listOf(BASE_URL_DAILY, BASE_URL_SANDBOX, BASE_URL_PROD)) {
+                    val req = Request.Builder()
+                        .url("$ep:loadCodeAssist")
+                        .addHeader("Authorization", "Bearer $token")
+                        .addHeader("User-Agent", USER_AGENT)
+                        .addHeader("Content-Type", "application/json")
+                        .post(bodyJson.toRequestBody("application/json".toMediaType()))
+                        .build()
+
+                    val outcome = runCatching {
+                        httpClient.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use null
+                            val obj = json.parseToJsonElement(resp.body.string()).jsonObject
+                            val pid = obj["cloudaicompanionProject"]?.asStrOrNull().orEmpty()
+                            val paidId = obj["paidTier"]?.let { runCatching { it.jsonObject }.getOrNull() }
+                                ?.let { it["id"].asStrOrNull() ?: it["name"].asStrOrNull() }
+                            val curId = obj["currentTier"]?.let { runCatching { it.jsonObject }.getOrNull() }
+                                ?.let { it["id"].asStrOrNull() ?: it["name"].asStrOrNull() }
+                            val resolvedTier = normalizeTierLabel(paidId ?: curId ?: "free-tier")
+                            pid to resolvedTier
+                        }
+                    }.getOrNull()
+
+                    if (outcome != null) {
+                        var (pid, tier) = outcome
+                        if (pid.isBlank()) {
+                            pid = tryOnboardFreeTier(token)
+                        }
+                        acc.tierLabel = tier
+                        if (pid.isNotBlank()) acc.projectId = pid
+                        return@withContext acc.projectId.ifBlank { "aicode-consumers" }
+                    }
+                }
+                acc.projectId.ifBlank { "aicode-consumers" }
+            }
         }
     }
 
@@ -261,7 +289,7 @@ class OAuthAccountPool {
         for ((idx, acc) in snapshot.withIndex()) {
             runCatching {
                 val token = getAccessToken(acc)
-                val pid = getProjectId(acc, token)
+                val pid = getProjectId(acc, token, forceRefresh = true)
                 val bodyJson = if (pid.isNotBlank()) """{"project":"$pid"}""" else "{}"
                 val req = Request.Builder()
                     .url("$BASE_URL_DAILY:fetchAvailableModels")

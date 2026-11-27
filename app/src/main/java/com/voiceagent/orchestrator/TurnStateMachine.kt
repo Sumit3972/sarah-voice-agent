@@ -21,6 +21,7 @@ import com.voiceagent.audio.LowLatencyAudioPlayer
 import com.voiceagent.audio.PreRollRingBuffer
 import com.voiceagent.audio.SmartTurnDetector
 import com.voiceagent.audio.WakeCuePlayer
+import com.voiceagent.autonomous.SwarmOrchestrator
 import com.voiceagent.config.PipelineConfig
 import com.voiceagent.config.SecretsProvider
 import com.voiceagent.config.WakeCueMode
@@ -285,7 +286,7 @@ internal object LocalFastPathMatcher {
                 LocalFastPathAction("device_intent", "go_home", "Went home.")
             Regex("^(close all apps|close them all|clear (all )?background apps)$").matches(norm) ->
                 LocalFastPathAction("device_intent", "close_all_apps", "Closed background apps.")
-            Regex("^stop all (background )?(tasks|loops|routines)$").matches(norm) ->
+            Regex("^stop all (background )?(tasks?|loops?|routines?|jobs?|automations?)$").matches(norm) ->
                 LocalFastPathAction("autonomous_task", "stop_all_tasks", "Stopped all autonomous tasks.")
             else -> null
         }
@@ -322,7 +323,8 @@ class TurnStateMachine(
     private val llmRouter: StreamingLlmRouter,
     private val sttClient: DeepgramRealtimeWsClient,
     private val fishClient: FishAudioLiveWsClient,
-    private val audioPlayer: LowLatencyAudioPlayer
+    private val audioPlayer: LowLatencyAudioPlayer,
+    private val swarmOrchestrator: SwarmOrchestrator? = null
 ) {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val audioPipeline = AudioPipeline(appContext)
@@ -1584,6 +1586,7 @@ class TurnStateMachine(
         activeReplyJob = null
         activeSpokenTtsText = ""
         llmRouter.cancelActive()
+        swarmOrchestrator?.cancelAllWorkers("reply_cancelled")
         fishClient.abortNow()
         audioPlayer.abortImmediate()
     }
@@ -1639,6 +1642,9 @@ class TurnStateMachine(
                     LocalFastPathMatcher.match(userText)
                 } else null
                 if (fastPath != null) {
+                    if (fastPath.action == "stop_all_tasks") {
+                        swarmOrchestrator?.cancelAllWorkers("stop_all_tasks")
+                    }
                     val ttsDeferredFast = async(Dispatchers.IO) {
                         fishClient.startSession(latencyMode = "balanced")
                     }

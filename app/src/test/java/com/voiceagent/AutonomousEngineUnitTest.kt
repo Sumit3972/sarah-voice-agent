@@ -1,13 +1,18 @@
 package com.voiceagent
 
+import com.voiceagent.accessibility.AppShortcutStore
 import com.voiceagent.autonomous.AutonomousTaskHelpers
 import com.voiceagent.autonomous.DirectiveType
+import com.voiceagent.llm.AccountState
 import com.voiceagent.llm.MercuryDecideRouter
 import com.voiceagent.llm.RouteDecisionTarget
 import com.voiceagent.memory.AutonomousTaskEntity
 import com.voiceagent.notifications.CachedNotification
+import com.voiceagent.orchestrator.LocalFastPathMatcher
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -125,5 +130,38 @@ class AutonomousEngineUnitTest {
         )
         assertEquals(RouteDecisionTarget.GEMINI_SMART, target)
         assertEquals("LOW", effort)
+
+        val swarmTools = router.inferKeywordTools("Check weather and battery simultaneously in parallel")
+        assertTrue("swarm_dispatch" in swarmTools)
+    }
+
+    @Test
+    fun localFastPath_matchesSingularAndPluralStopAllTaskAndShortcutStoreCaches() = runBlocking {
+        val singular = LocalFastPathMatcher.match("stop all task")
+        assertNotNull(singular)
+        assertEquals("autonomous_task", singular?.toolName)
+        assertEquals("stop_all_tasks", singular?.action)
+
+        val plural = LocalFastPathMatcher.match("Sarah please stop all background tasks")
+        assertNotNull(plural)
+        assertEquals("stop_all_tasks", plural?.action)
+
+        val store = AppShortcutStore(dao = null)
+        store.recordSendShortcut(
+            packageName = "org.telegram.plus",
+            inputViewId = "chat_text_entry",
+            sendViewId = "chat_send_button",
+            sendLabel = "Send",
+            replyMode = "swipe_right"
+        )
+        val cached = store.get("org.telegram.plus")
+        assertNotNull(cached)
+        assertEquals("chat_send_button", cached?.sendViewId)
+        assertEquals("swipe_right", cached?.replyMode)
+
+        val acc = AccountState(email = "single@example.com", refreshToken = "rt")
+        assertEquals(1, acc.inFlightCount.incrementAndGet())
+        assertEquals(2, acc.inFlightCount.incrementAndGet())
+        assertEquals(1, acc.inFlightCount.decrementAndGet())
     }
 }

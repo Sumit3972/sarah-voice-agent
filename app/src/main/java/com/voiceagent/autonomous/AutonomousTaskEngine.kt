@@ -153,13 +153,14 @@ class AutonomousTaskEngine(
     private val dao: MemoryDao,
     private val toolRegistry: SaraToolRegistry,
     private val llmRouter: StreamingLlmRouter,
-    private val speakProactive: suspend (String) -> Boolean
+    private val speakProactive: suspend (String) -> Boolean,
+    private val swarmOrchestrator: SwarmOrchestrator? = null
 ) {
     companion object {
         const val CHANNEL_ONGOING = "sarah_autonomous_tasks"
         const val CHANNEL_ALERTS = "sarah_autonomous_alerts"
         const val ONGOING_NOTIFICATION_ID = 4205
-        private const val DEBOUNCE_BURST_MS = 2200L
+        private const val DEBOUNCE_BURST_MS = 800L
         private const val DEDUP_WINDOW_MS = 60_000L
 
         private val AUTONOMOUS_TOOL_SET = setOf(
@@ -171,12 +172,15 @@ class AutonomousTaskEngine(
             "ui_act",
             "shizuku_shell",
             "personal_scheduler",
-            "memory_facts"
+            "memory_facts",
+            "swarm_dispatch"
         )
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val executionMutex = Mutex()
+    private val taskMutexes = ConcurrentHashMap<Long, Mutex>()
+    private val fallbackScreenLease = Mutex()
+    private val activeTickJobs = ConcurrentHashMap<Long, MutableSet<Job>>()
     private val pendingNotifBuffers = ConcurrentHashMap<Long, MutableList<CachedNotification>>()
     private val debounceJobs = ConcurrentHashMap<Long, Job>()
     private val recentNotifSignatures = ConcurrentHashMap<Long, Pair<String, Long>>()
@@ -229,7 +233,7 @@ class AutonomousTaskEngine(
             if (nextMs != null) {
                 if (nextMs <= now) {
                     if (task.mode == AutonomousTaskHelpers.MODE_ONE_SHOT) {
-                        scope.launch { executeTaskTick(task.id, "ALARM", null) }
+                        launchTaskTick(task.id, "ALARM", null)
                     } else if (task.intervalMinutes != null && task.intervalMinutes > 0.0) {
                         val rescheduled = now + (task.intervalMinutes * 60_000.0).toLong().coerceAtLeast(15_000L)
                         dao.updateAutonomousTask(task.copy(nextTriggerAtMs = rescheduled, updatedAt = now))
@@ -251,7 +255,7 @@ class AutonomousTaskEngine(
         Log.i(PipelineConfig.LOG_TAG, "[AutonomousEngine] Device unlocked -> resuming ${waiting.size} waiting task(s)")
         for (task in waiting) {
             dao.updateAutonomousTaskStatus(task.id, AutonomousTaskHelpers.STATUS_ACTIVE)
-            scope.launch { executeTaskTick(task.id, "UNLOCK_RESUME", null) }
+            launchTaskTick(task.id, "UNLOCK_RESUME", null)
         }
         refreshOngoingNotification()
     }
@@ -299,15 +303,29 @@ class AutonomousTaskEngine(
     }
 
     fun onAlarmFired(taskId: Long) {
-        scope.launch {
-            executeTaskTick(taskId, "ALARM", null)
-        }
+        launchTaskTick(taskId, "ALARM", null)
     }
 
     fun triggerTaskNow(taskId: Long) {
-        scope.launch {
-            executeTaskTick(taskId, "MANUAL", null)
+        launchTaskTick(taskId, "MANUAL", null)
+    }
+
+    private fun launchTaskTick(taskId: Long, triggerSource: String, eventPayload: String?) {
+        val jobSet = activeTickJobs.computeIfAbsent(taskId) { ConcurrentHashMap.newKeySet() }
+        val job = scope.launch {
+            executeTaskTick(taskId, triggerSource, eventPayload)
         }
+        jobSet += job
+        job.invokeOnCompletion {
+            jobSet.remove(job)
+        }
+    }
+
+    private fun cancelAllTickJobsForTask(taskId: Long) {
+        activeTickJobs.remove(taskId)?.let { jobs ->
+            jobs.toList().forEach { it.cancel() }
+        }
+        llmRouter.antigravityProvider.cancelCall("autonomous_task_$taskId")
     }
 
     suspend fun createTask(
@@ -318,7 +336,7 @@ class AutonomousTaskEngine(
         watchSender: String = "",
         nextTriggerAtMs: Long? = null,
         intervalMinutes: Double? = null,
-        cooldownSeconds: Int = 5,
+        cooldownSeconds: Int = 2,
         maxRuns: Int = if (mode == AutonomousTaskHelpers.MODE_EVENT_CHAT_LOOP) 40 else 24,
         needsScreenUi: Boolean = false,
         speakOnMilestone: Boolean = true,
@@ -370,9 +388,7 @@ class AutonomousTaskEngine(
         refreshOngoingNotification()
 
         if (triggerImmediately) {
-            scope.launch {
-                executeTaskTick(id, "START", initialEventPayload)
-            }
+            launchTaskTick(id, "START", initialEventPayload)
         }
         return saved
     }
@@ -380,6 +396,7 @@ class AutonomousTaskEngine(
     suspend fun pauseTask(taskId: Long): Boolean {
         val task = dao.getAutonomousTaskById(taskId) ?: return false
         debounceJobs.remove(taskId)?.cancel()
+        cancelAllTickJobsForTask(taskId)
         cancelAlarm(taskId)
         dao.updateAutonomousTaskStatus(taskId, AutonomousTaskHelpers.STATUS_PAUSED)
         dao.insertAutonomousTaskLog(
@@ -418,8 +435,10 @@ class AutonomousTaskEngine(
     suspend fun stopTask(taskId: Long): Boolean {
         val task = dao.getAutonomousTaskById(taskId) ?: return false
         debounceJobs.remove(taskId)?.cancel()
+        cancelAllTickJobsForTask(taskId)
         pendingNotifBuffers.remove(taskId)
         cancelAlarm(taskId)
+        taskMutexes.remove(taskId)
         dao.updateAutonomousTask(
             task.copy(
                 status = AutonomousTaskHelpers.STATUS_STOPPED,
@@ -443,8 +462,10 @@ class AutonomousTaskEngine(
         val runnable = dao.getRunnableOrWaitingAutonomousTasks()
         for (task in runnable) {
             debounceJobs.remove(task.id)?.cancel()
+            cancelAllTickJobsForTask(task.id)
             pendingNotifBuffers.remove(task.id)
             cancelAlarm(task.id)
+            taskMutexes.remove(task.id)
             dao.updateAutonomousTask(
                 task.copy(
                     status = AutonomousTaskHelpers.STATUS_STOPPED,
@@ -461,7 +482,11 @@ class AutonomousTaskEngine(
                 )
             )
         }
+        for (taskId in activeTickJobs.keys.toList()) {
+            cancelAllTickJobsForTask(taskId)
+        }
         refreshOngoingNotification()
+        swarmOrchestrator?.cancelAllWorkers("stop_all_tasks")
         return runnable.size
     }
 
@@ -469,6 +494,7 @@ class AutonomousTaskEngine(
         val active = dao.getActiveAutonomousTasks()
         for (task in active) {
             debounceJobs.remove(task.id)?.cancel()
+            cancelAllTickJobsForTask(task.id)
             cancelAlarm(task.id)
             dao.updateAutonomousTaskStatus(task.id, AutonomousTaskHelpers.STATUS_PAUSED)
         }
@@ -478,6 +504,7 @@ class AutonomousTaskEngine(
 
     suspend fun deleteTask(taskId: Long) {
         debounceJobs.remove(taskId)?.cancel()
+        cancelAllTickJobsForTask(taskId)
         pendingNotifBuffers.remove(taskId)
         cancelAlarm(taskId)
         dao.deleteLogsForTask(taskId)
@@ -489,7 +516,7 @@ class AutonomousTaskEngine(
         taskId: Long,
         triggerSource: String,
         eventPayload: String?
-    ) = executionMutex.withLock {
+    ) = taskMutexes.getOrPut(taskId) { Mutex() }.withLock {
         val task = dao.getAutonomousTaskById(taskId) ?: return@withLock
         if (task.status != AutonomousTaskHelpers.STATUS_ACTIVE) {
             Log.d(PipelineConfig.LOG_TAG, "[AutonomousEngine] Skipping tick for #$taskId (status=${task.status})")
@@ -611,21 +638,33 @@ class AutonomousTaskEngine(
             var completedText = ""
             val thinkingLevel = if (requiresUiNow) "MEDIUM" else "LOW"
 
-            Log.i(PipelineConfig.LOG_TAG, "[AutonomousEngine] Executing tick #${task.runCount + 1} for task #$taskId (${task.title}) via Gemini Smart ($thinkingLevel)")
+            Log.i(PipelineConfig.LOG_TAG, "[AutonomousEngine] Executing tick #${task.runCount + 1} for task #$taskId (${task.title}) via Gemini 4 Hydrogen ($thinkingLevel)")
 
-            llmRouter.antigravityProvider.streamTurn(
-                context = context,
-                userText = tickUserPrompt,
-                selectedTools = AUTONOMOUS_TOOL_SET,
-                thinkingLevel = thinkingLevel,
-                trackActiveCall = false
-            ).collect { ev ->
-                when (ev) {
-                    is LlmStreamEvent.ToolExecuted -> toolsUsed += ev.name
-                    is LlmStreamEvent.TextDelta -> textBuf.append(ev.delta)
-                    is LlmStreamEvent.Completed -> completedText = ev.fullText
-                    else -> {}
+            val callTag = "autonomous_task_$taskId"
+            val runStream: suspend () -> Unit = {
+                llmRouter.antigravityProvider.streamTurn(
+                    context = context,
+                    userText = tickUserPrompt,
+                    selectedTools = AUTONOMOUS_TOOL_SET,
+                    thinkingLevel = thinkingLevel,
+                    trackActiveCall = true,
+                    callTag = callTag
+                ).collect { ev ->
+                    when (ev) {
+                        is LlmStreamEvent.ToolExecuted -> toolsUsed += ev.name
+                        is LlmStreamEvent.TextDelta -> textBuf.append(ev.delta)
+                        is LlmStreamEvent.Completed -> completedText = ev.fullText
+                        else -> {}
+                    }
                 }
+            }
+            if (requiresUiNow) {
+                val lease = swarmOrchestrator?.screenLease ?: fallbackScreenLease
+                lease.withLock {
+                    runStream()
+                }
+            } else {
+                runStream()
             }
 
             val rawOut = completedText.ifBlank { textBuf.toString() }.trim()

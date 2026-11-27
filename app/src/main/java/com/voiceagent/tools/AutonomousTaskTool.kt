@@ -38,7 +38,7 @@ class AutonomousTaskTool(
         val inMinutes = args["in_minutes"].asDoubleOrNull()
         val intervalMinutes = args["interval_minutes"].asDoubleOrNull()
         val startIso = args["start_iso"].asStrOrNull()?.trim().orEmpty()
-        val cooldownSeconds = args["cooldown_seconds"].asIntOrNull() ?: 5
+        val cooldownSeconds = args["cooldown_seconds"].asIntOrNull() ?: 2
         val maxRuns = args["max_runs"].asIntOrNull()
         val needsScreenUi = args["needs_screen_ui"].asBoolOrNull() ?: false
         val speakOnMilestone = args["speak_on_milestone"].asBoolOrNull() ?: true

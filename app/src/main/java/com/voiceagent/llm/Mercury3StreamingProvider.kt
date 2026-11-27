@@ -25,12 +25,14 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 sealed class LlmStreamEvent {
@@ -51,6 +53,10 @@ class Mercury3StreamingProvider(
     private val json = Json { ignoreUnknownKeys = true }
 
     private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 32
+            maxRequestsPerHost = 12
+        })
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
@@ -63,14 +69,25 @@ class Mercury3StreamingProvider(
         .callTimeout(1500, TimeUnit.MILLISECONDS)
         .build()
 
-    @Volatile
-    private var activeCall: Call? = null
+    private val activeCalls = ConcurrentHashMap<String, Call>()
 
     fun cancelActive() {
-        try {
-            activeCall?.cancel()
-        } catch (_: Exception) {}
-        activeCall = null
+        cancelCall("foreground")
+    }
+
+    fun cancelCall(callTag: String) {
+        activeCalls.remove(callTag)?.let { call ->
+            runCatching { call.cancel() }
+        }
+    }
+
+    fun cancelAllCalls() {
+        val keys = activeCalls.keys.toList()
+        for (k in keys) {
+            activeCalls.remove(k)?.let { call ->
+                runCatching { call.cancel() }
+            }
+        }
     }
 
     suspend fun generateDynamicAck(userUtterance: String, activePackage: String): String? = withContext(Dispatchers.IO) {
@@ -127,6 +144,7 @@ class Mercury3StreamingProvider(
         selectedTools: Set<String> = emptySet(),
         sourceMessageId: Long? = null,
         reasoningEffort: String = "high",
+        callTag: String = "foreground",
         visionDescriber: (suspend (String, String, String) -> String?)? = null
     ): Flow<LlmStreamEvent> = flow {
         val apiKey = SecretsProvider.inceptionApiKey()
@@ -164,6 +182,7 @@ class Mercury3StreamingProvider(
                     tools = tools,
                     streamDeltasImmediately = streamImmediately,
                     reasoningEffort = if (round > 0) "high" else reasoningEffort,
+                    callTag = callTag,
                     onDelta = { delta ->
                         accumulatedText.append(delta)
                         emit(LlmStreamEvent.TextDelta(delta))
@@ -314,6 +333,7 @@ class Mercury3StreamingProvider(
                     tools = JsonArray(emptyList()),
                     streamDeltasImmediately = true,
                     reasoningEffort = "instant",
+                    callTag = callTag,
                     onDelta = { delta ->
                         accumulatedText.append(delta)
                         emit(LlmStreamEvent.TextDelta(delta))
@@ -326,6 +346,9 @@ class Mercury3StreamingProvider(
             }
         } catch (e: Exception) {
             currentCoroutineContext().ensureActive()
+            if (e is java.io.IOException && e.message?.contains("canceled", ignoreCase = true) == true) {
+                throw kotlinx.coroutines.CancellationException("Mercury3 call canceled", e)
+            }
             ToolTraceLogger.recordException(
                 sessionId = context.sessionId,
                 stage = "mercury3",
@@ -353,6 +376,7 @@ class Mercury3StreamingProvider(
         tools: JsonArray,
         streamDeltasImmediately: Boolean,
         reasoningEffort: String = "high",
+        callTag: String = "foreground",
         onDelta: suspend (String) -> Unit
     ): StreamRoundResult {
         val url = "${SecretsProvider.inceptionBaseUrl().trimEnd('/')}/chat/completions"
@@ -378,14 +402,15 @@ class Mercury3StreamingProvider(
             .build()
 
         val call = client.newCall(req)
-        activeCall = call
+        activeCalls[callTag] = call
 
         val roundText = StringBuilder()
         val tcIds = mutableMapOf<Int, String>()
         val tcNames = mutableMapOf<Int, String>()
         val tcArgs = mutableMapOf<Int, StringBuilder>()
 
-        call.execute().use { resp ->
+        try {
+            call.execute().use { resp ->
             if (!resp.isSuccessful) {
                 val errBody = resp.body.string()
                 throw IllegalStateException("Mercury3 HTTP ${resp.code}: ${errBody.take(300)}")
@@ -435,6 +460,9 @@ class Mercury3StreamingProvider(
                     }
                 }
             }
+            }
+        } finally {
+            activeCalls.remove(callTag, call)
         }
 
         val parsedTools = tcNames.keys.sorted().mapNotNull { idx ->

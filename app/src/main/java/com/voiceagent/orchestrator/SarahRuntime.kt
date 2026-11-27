@@ -3,6 +3,7 @@ package com.voiceagent.orchestrator
 import android.content.Context
 import com.voiceagent.audio.LowLatencyAudioPlayer
 import com.voiceagent.autonomous.AutonomousTaskEngine
+import com.voiceagent.autonomous.SwarmOrchestrator
 import com.voiceagent.config.SecretsProvider
 import com.voiceagent.debug.ToolTraceLogger
 import com.voiceagent.llm.AntigravityCodeAssistProvider
@@ -44,6 +45,7 @@ class SarahRuntime private constructor(context: Context) {
     val mercuryProvider = Mercury3StreamingProvider(toolRegistry)
     val antigravityProvider = AntigravityCodeAssistProvider(oauthPool, toolRegistry)
     val llmRouter = StreamingLlmRouter(decideRouter, mercuryProvider, antigravityProvider)
+    val swarmOrchestrator = SwarmOrchestrator(llmRouter)
 
     val sttClient = DeepgramRealtimeWsClient()
     val callCoordinator = com.voiceagent.audio.CallAndAudioFocusCoordinator(appContext)
@@ -60,7 +62,8 @@ class SarahRuntime private constructor(context: Context) {
         llmRouter = llmRouter,
         sttClient = sttClient,
         fishClient = fishClient,
-        audioPlayer = audioPlayer
+        audioPlayer = audioPlayer,
+        swarmOrchestrator = swarmOrchestrator
     )
 
     val autonomousEngine = AutonomousTaskEngine(
@@ -68,7 +71,8 @@ class SarahRuntime private constructor(context: Context) {
         dao = dao,
         toolRegistry = toolRegistry,
         llmRouter = llmRouter,
-        speakProactive = { msg -> stateMachine.speakProactiveMessage(msg) }
+        speakProactive = { msg -> stateMachine.speakProactiveMessage(msg) },
+        swarmOrchestrator = swarmOrchestrator
     )
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -76,6 +80,7 @@ class SarahRuntime private constructor(context: Context) {
     init {
         ToolTraceLogger.init(appContext, dao)
         ShizukuBridge.init(appContext)
+        toolRegistry.attachSwarmOrchestrator(swarmOrchestrator)
         toolRegistry.attachAutonomousEngine(autonomousEngine)
         autonomousEngine.start()
         scope.launch {

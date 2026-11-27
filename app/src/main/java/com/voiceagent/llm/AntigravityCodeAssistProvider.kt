@@ -10,6 +10,9 @@ import com.voiceagent.debug.ToolTraceLogger
 import com.voiceagent.memory.AssembledLlmContext
 import com.voiceagent.tools.SaraToolRegistry
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -23,34 +26,62 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class AntigravityCodeAssistProvider(
     private val pool: OAuthAccountPool,
     private val toolRegistry: SaraToolRegistry
 ) {
+    companion object {
+        private val PARALLEL_HEADLESS_TOOLS = setOf(
+            "device_status",
+            "live_info",
+            "notification_center",
+            "memory_facts",
+            "session_store",
+            "personal_scheduler"
+        )
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 32
+            maxRequestsPerHost = 12
+        })
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(35, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
         .build()
 
-    @Volatile
-    private var activeCall: Call? = null
+    private val activeCalls = ConcurrentHashMap<String, Call>()
 
     fun cancelActive() {
-        try {
-            activeCall?.cancel()
-        } catch (_: Exception) {}
-        activeCall = null
+        cancelCall("foreground")
+    }
+
+    fun cancelCall(callTag: String) {
+        activeCalls.remove(callTag)?.let { call ->
+            runCatching { call.cancel() }
+        }
+    }
+
+    fun cancelAllCalls() {
+        val keys = activeCalls.keys.toList()
+        for (k in keys) {
+            activeCalls.remove(k)?.let { call ->
+                runCatching { call.cancel() }
+            }
+        }
     }
 
     private val modelHierarchy = listOf(
@@ -69,7 +100,8 @@ class AntigravityCodeAssistProvider(
         imageMimeType: String = "image/webp",
         sourceMessageId: Long? = null,
         thinkingLevel: String = "MEDIUM",
-        trackActiveCall: Boolean = true
+        trackActiveCall: Boolean = true,
+        callTag: String = "foreground"
     ): Flow<LlmStreamEvent> = flow {
         val accounts = pool.getOrderedAccounts("gemini")
         if (accounts.isEmpty()) throw IllegalStateException("No Antigravity OAuth accounts configured")
@@ -118,11 +150,14 @@ class AntigravityCodeAssistProvider(
             val projectId = pool.getProjectId(acc, token)
 
             for (model in modelHierarchy) {
-                if (model.contains("claude") && acc.isOnCooldown("claude")) continue
+                val isClaude = model.contains("claude")
+                if (isClaude && acc.isOnCooldown("claude")) continue
+                if (!isClaude && acc.isOnCooldown("gemini")) continue
                 currentCoroutineContext().ensureActive()
 
+                pool.incrementInFlight(acc)
                 try {
-                    Log.i(PipelineConfig.LOG_TAG, "[Antigravity] Trying $model (thinking=$thinkingLevel) on ${acc.email} (tools=${selectedTools.size})...")
+                    Log.i(PipelineConfig.LOG_TAG, "[Antigravity] Trying $model (thinking=$thinkingLevel, tag=$callTag) on ${acc.email} (tools=${selectedTools.size})...")
                     val fullText = StringBuilder()
                     val workingContents = baseContents.toMutableList()
                     if (executedProgressNotes.isNotEmpty()) {
@@ -154,6 +189,7 @@ class AntigravityCodeAssistProvider(
                             forceToolCall = (round == 0 && toolDecls.isNotEmpty() && !model.contains("claude") && model != OAuthAccountPool.MODEL_GEMINI_4_HYDROGEN),
                             thinkingLevel = thinkingLevel,
                             trackActiveCall = trackActiveCall,
+                            callTag = callTag,
                             onDelta = { delta ->
                                 fullText.append(delta)
                                 emit(LlmStreamEvent.TextDelta(delta))
@@ -196,18 +232,56 @@ class AntigravityCodeAssistProvider(
                             })
                         }
 
-                        // Execute tools & append functionResponse + optional Set-of-Marks inlineData image
-                        val respParts = mutableListOf<JsonObject>()
-                        var latestImage: Pair<String, String>? = null
-                        var roundSawUiNoChange = false
-                        for (fc in roundResult.functionCalls) {
+                        // Execute headless tools in parallel when multiple are requested; serialize UI/state-mutating tools
+                        val indexedCalls = roundResult.functionCalls.withIndex().toList()
+                        val headlessCalls = indexedCalls.filter { it.value.name in PARALLEL_HEADLESS_TOOLS }
+                        val serialCalls = indexedCalls.filter { it.value.name !in PARALLEL_HEADLESS_TOOLS }
+                        val orderedOutputs = arrayOfNulls<com.voiceagent.tools.ToolExecutionOutput>(indexedCalls.size)
+
+                        if (headlessCalls.size > 1) {
+                            coroutineScope {
+                                headlessCalls.map { (idx, fc) ->
+                                    async {
+                                        currentCoroutineContext().ensureActive()
+                                        idx to toolRegistry.executeTool(
+                                            name = fc.name,
+                                            args = fc.args,
+                                            userSpokenText = userText,
+                                            sourceMessageId = sourceMessageId
+                                        )
+                                    }
+                                }.awaitAll().forEach { (idx, out) ->
+                                    orderedOutputs[idx] = out
+                                }
+                            }
+                        } else {
+                            for ((idx, fc) in headlessCalls) {
+                                currentCoroutineContext().ensureActive()
+                                orderedOutputs[idx] = toolRegistry.executeTool(
+                                    name = fc.name,
+                                    args = fc.args,
+                                    userSpokenText = userText,
+                                    sourceMessageId = sourceMessageId
+                                )
+                            }
+                        }
+
+                        for ((idx, fc) in serialCalls) {
                             currentCoroutineContext().ensureActive()
-                            val toolOut = toolRegistry.executeTool(
+                            orderedOutputs[idx] = toolRegistry.executeTool(
                                 name = fc.name,
                                 args = fc.args,
                                 userSpokenText = userText,
                                 sourceMessageId = sourceMessageId
                             )
+                        }
+
+                        val respParts = mutableListOf<JsonObject>()
+                        var latestImage: Pair<String, String>? = null
+                        var roundSawUiNoChange = false
+                        for ((idx, fc) in indexedCalls) {
+                            val toolOut = orderedOutputs[idx]
+                                ?: com.voiceagent.tools.ToolExecutionOutput("""{"ok":false,"error":"Missing tool output"}""")
                             executedProgressNotes += "${fc.name}(${fc.args}) -> ${toolOut.resultJson.take(140)}"
                             if (fc.name == "ui_act" && toolOut.resultJson.contains("\"screen_changed\":false")) {
                                 roundSawUiNoChange = true
@@ -292,6 +366,9 @@ class AntigravityCodeAssistProvider(
                     throw ce
                 } catch (e: Exception) {
                     currentCoroutineContext().ensureActive()
+                    if (e is java.io.IOException && e.message?.contains("canceled", ignoreCase = true) == true) {
+                        throw kotlinx.coroutines.CancellationException("Antigravity call canceled", e)
+                    }
                     lastError = e
                     val msg = e.message.orEmpty()
                     Log.w(PipelineConfig.LOG_TAG, "[Antigravity] $model failed on ${acc.email}: $msg")
@@ -306,6 +383,16 @@ class AntigravityCodeAssistProvider(
                         acc.putOnCooldown("auth", 15 * 60_000L)
                         break
                     }
+                    if (isQuotaError(msg)) {
+                        val isClaude = model.contains("claude")
+                        acc.putOnCooldown(if (isClaude) "claude" else "gemini", 15 * 60_000L)
+                        if (!isClaude && accounts.size > 1) {
+                            Log.i(PipelineConfig.LOG_TAG, "[Antigravity] Gemini quota hit on ${acc.email}; failing over to next account immediately")
+                            break
+                        }
+                    }
+                } finally {
+                    pool.decrementInFlight(acc)
                 }
             }
 
@@ -433,6 +520,7 @@ class AntigravityCodeAssistProvider(
         forceToolCall: Boolean = false,
         thinkingLevel: String? = null,
         trackActiveCall: Boolean = true,
+        callTag: String = "foreground",
         onDelta: suspend (String) -> Unit
     ): SseRoundResult {
         val normalizedHydrogenLevel = if (model == OAuthAccountPool.MODEL_GEMINI_4_HYDROGEN) {
@@ -513,8 +601,9 @@ class AntigravityCodeAssistProvider(
         }
 
         val call = client.newCall(reqBuilder.post(payload.toRequestBody("application/json".toMediaType())).build())
-        if (trackActiveCall) {
-            activeCall = call
+        val shouldTrack = trackActiveCall || callTag != "foreground"
+        if (shouldTrack) {
+            activeCalls[callTag] = call
         }
 
         val textBuf = StringBuilder()
@@ -522,7 +611,8 @@ class AntigravityCodeAssistProvider(
         var lastFinishReason = ""
         var lastUsageSummary = ""
 
-        call.execute().use { resp ->
+        try {
+            call.execute().use { resp ->
             if (!resp.isSuccessful) {
                 val errStr = resp.body.string()
                 throw IllegalStateException("HTTP ${resp.code}: ${errStr.take(300)}")
@@ -579,6 +669,11 @@ class AntigravityCodeAssistProvider(
                     }
                 }
             }
+            }
+        } finally {
+            if (shouldTrack) {
+                activeCalls.remove(callTag, call)
+            }
         }
 
         if (textBuf.isEmpty() && funcCalls.isEmpty()) {
@@ -590,5 +685,10 @@ class AntigravityCodeAssistProvider(
     private fun isAuthError(msg: String): Boolean {
         val lower = msg.lowercase()
         return lower.contains("http 401") || lower.contains("invalid_grant") || lower.contains("unauthorized")
+    }
+
+    private fun isQuotaError(msg: String): Boolean {
+        val lower = msg.lowercase()
+        return lower.contains("http 429") || lower.contains("resource_exhausted") || lower.contains("quota")
     }
 }

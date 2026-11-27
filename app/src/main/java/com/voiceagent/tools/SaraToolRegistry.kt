@@ -2,8 +2,10 @@ package com.voiceagent.tools
 
 import android.content.Context
 import android.util.Log
+import com.voiceagent.accessibility.AppShortcutStore
 import com.voiceagent.accessibility.SaraAccessibilityService
 import com.voiceagent.autonomous.AutonomousTaskEngine
+import com.voiceagent.autonomous.SwarmOrchestrator
 import com.voiceagent.config.PipelineConfig
 import com.voiceagent.debug.ToolTraceLogger
 import com.voiceagent.memory.FactMemoryTools
@@ -44,6 +46,7 @@ class SaraToolRegistry(
             "notification_center",
             "personal_scheduler",
             "autonomous_task",
+            "swarm_dispatch",
             "live_info",
             "observe_screen",
             "ui_act",
@@ -59,12 +62,18 @@ class SaraToolRegistry(
     val notificationCenterTool = NotificationCenterTool(appContext)
     val personalSchedulerTool = PersonalSchedulerTool(appContext, dao)
     val autonomousTaskTool = AutonomousTaskTool(dao)
+    val swarmTool = SwarmTool()
     val liveInfoTool = LiveInfoTool()
-    val screenTools = ScreenTools()
+    val appShortcutStore = AppShortcutStore(dao)
+    val screenTools = ScreenTools(appShortcutStore)
     val shizukuShellTool = ShizukuShellTool(appContext)
 
     fun attachAutonomousEngine(engine: AutonomousTaskEngine) {
         autonomousTaskTool.engine = engine
+    }
+
+    fun attachSwarmOrchestrator(orchestrator: SwarmOrchestrator) {
+        swarmTool.orchestrator = orchestrator
     }
 
     fun clearPerTurnState() {
@@ -79,6 +88,7 @@ class SaraToolRegistry(
             if ("notification_center" in active) add(notificationCenterOpenAi())
             if ("personal_scheduler" in active) add(personalSchedulerOpenAi())
             if ("autonomous_task" in active) add(autonomousTaskOpenAi())
+            if ("swarm_dispatch" in active) add(swarmDispatchOpenAi())
             if ("live_info" in active) add(liveInfoOpenAi())
             if ("observe_screen" in active) add(observeScreenOpenAi())
             if ("ui_act" in active) add(uiActOpenAi())
@@ -96,6 +106,7 @@ class SaraToolRegistry(
             if ("notification_center" in active) add(notificationCenterGemini())
             if ("personal_scheduler" in active) add(personalSchedulerGemini())
             if ("autonomous_task" in active) add(autonomousTaskGemini())
+            if ("swarm_dispatch" in active) add(swarmDispatchGemini())
             if ("live_info" in active) add(liveInfoGemini())
             if ("observe_screen" in active) add(observeScreenGemini())
             if ("ui_act" in active) add(uiActGemini())
@@ -137,6 +148,7 @@ class SaraToolRegistry(
                 "notification_center" -> ToolExecutionOutput(notificationCenterTool.execute(args))
                 "personal_scheduler" -> ToolExecutionOutput(personalSchedulerTool.execute(args))
                 "autonomous_task" -> ToolExecutionOutput(autonomousTaskTool.execute(args))
+                "swarm_dispatch" -> ToolExecutionOutput(swarmTool.execute(args))
                 "live_info" -> ToolExecutionOutput(liveInfoTool.execute(args))
                 "observe_screen" -> screenTools.observeScreen(args)
                 "ui_act" -> screenTools.uiAct(args, userSpokenText)
@@ -252,13 +264,35 @@ class SaraToolRegistry(
             put("in_minutes", prop("number", "Delay in minutes for create_scheduled_task"))
             put("interval_minutes", prop("number", "Repeat interval in minutes for create_watch_loop"))
             put("start_iso", prop("string", "Optional ISO timestamp for create_scheduled_task"))
-            put("cooldown_seconds", prop("integer", "Minimum seconds between consecutive chat loop replies (default 5)"))
+            put("cooldown_seconds", prop("integer", "Minimum seconds between consecutive chat loop replies (default 2)"))
             put("max_runs", prop("integer", "Safety cap on total autonomous ticks (default 40 chat, 24 watch)"))
             put("needs_screen_ui", prop("boolean", "True if task requires opening on-screen UI rather than headless tools/notifications"))
             put("speak_on_milestone", prop("boolean", "Speak aloud on completion/alerts (default true)"))
             put("speak_every_tick", prop("boolean", "Speak on every routine tick (default false)"))
         },
         required = listOf("action")
+    )
+
+    private fun swarmDispatchOpenAi() = openAiTool(
+        name = "swarm_dispatch",
+        description = "Spawn multiple concurrent AI worker copies in parallel for multi-part jobs (e.g., check weather + device status + notifications + UI action simultaneously) and collect all results in one turn.",
+        properties = buildJsonObject {
+            put("tasks", buildJsonObject {
+                put("type", "array")
+                put("description", "Up to 6 subtasks executed concurrently")
+                put("items", buildJsonObject {
+                    put("type", "object")
+                    put("properties", buildJsonObject {
+                        put("id", prop("string", "Short subtask identifier"))
+                        put("role", prop("string", "fast_responder | research_worker | ui_operator | speculative_drafter"))
+                        put("goal", prop("string", "Exact instruction for this worker"))
+                        put("thinking_level", prop("string", "Optional LOW | MEDIUM | HIGH"))
+                    })
+                    put("required", buildJsonArray { add(JsonPrimitive("goal")) })
+                })
+            })
+        },
+        required = listOf("tasks")
     )
 
     private fun liveInfoOpenAi() = openAiTool(
@@ -284,16 +318,20 @@ class SaraToolRegistry(
 
     private fun uiActOpenAi() = openAiTool(
         name = "ui_act",
-        description = "Execute single or batched UI steps on screen: tap_ref, tap_label, tap_xy, long_press_ref, type_text, scroll, swipe, global_action (back|home|recents|notifications), wait_settle.",
+        description = "Execute single or batched UI steps on screen: reply_or_send (1-turn quote-reply/type/send macro), tap_ref, tap_label, tap_xy, long_press_ref, type_text, scroll, swipe, global_action (back|home|recents|notifications), wait_settle.",
         properties = buildJsonObject {
             put("steps", buildJsonObject {
                 put("type", "array")
-                put("description", "Ordered steps array of objects with type, ref_id?, label?, text?, direction?, action?, x?, y?, press_enter?")
+                put("description", "Ordered steps array of objects with type, ref_id?, reply_to_ref?, reply_to_label?, input_ref?, send_ref?, label?, text?, direction?, action?, x?, y?, press_enter?")
                 put("items", buildJsonObject {
                     put("type", "object")
                     put("properties", buildJsonObject {
-                        put("type", prop("string", "tap_ref|tap_label|tap_xy|long_press_ref|type_text|scroll|swipe|global_action|wait_settle"))
+                        put("type", prop("string", "reply_or_send|tap_ref|tap_label|tap_xy|long_press_ref|type_text|scroll|swipe|global_action|wait_settle"))
                         put("ref_id", prop("integer", "Node [N] from observe_screen"))
+                        put("reply_to_ref", prop("integer", "Message node [N] to quote-reply to before typing in reply_or_send"))
+                        put("reply_to_label", prop("string", "Message text/sender snippet to quote-reply to when reply_to_ref omitted"))
+                        put("input_ref", prop("integer", "Optional input EditText node [N] for reply_or_send"))
+                        put("send_ref", prop("integer", "Optional Send button node [N] for reply_or_send"))
                         put("label", prop("string", "Element label text"))
                         put("text", prop("string", "Text to type"))
                         put("direction", prop("string", "up|down|left|right"))
@@ -334,6 +372,30 @@ class SaraToolRegistry(
     private fun notificationCenterGemini() = toGeminiSchema(notificationCenterOpenAi())
     private fun personalSchedulerGemini() = toGeminiSchema(personalSchedulerOpenAi())
     private fun autonomousTaskGemini() = toGeminiSchema(autonomousTaskOpenAi())
+    private fun swarmDispatchGemini(): JsonObject = buildJsonObject {
+        put("name", "swarm_dispatch")
+        put("description", "Spawn multiple concurrent AI worker copies in parallel for multi-part jobs and collect all results in one turn.")
+        put("parameters", buildJsonObject {
+            put("type", "OBJECT")
+            put("properties", buildJsonObject {
+                put("tasks", buildJsonObject {
+                    put("type", "ARRAY")
+                    put("description", "Up to 6 subtasks executed concurrently")
+                    put("items", buildJsonObject {
+                        put("type", "OBJECT")
+                        put("properties", buildJsonObject {
+                            put("id", prop("STRING", "Subtask ID"))
+                            put("role", prop("STRING", "fast_responder | research_worker | ui_operator | speculative_drafter"))
+                            put("goal", prop("STRING", "Exact instruction for this worker"))
+                            put("thinking_level", prop("STRING", "Optional LOW | MEDIUM | HIGH"))
+                        })
+                        put("required", buildJsonArray { add(JsonPrimitive("goal")) })
+                    })
+                })
+            })
+            put("required", buildJsonArray { add(JsonPrimitive("tasks")) })
+        })
+    }
     private fun liveInfoGemini() = toGeminiSchema(liveInfoOpenAi())
     private fun observeScreenGemini() = toGeminiSchema(observeScreenOpenAi())
 
@@ -359,7 +421,7 @@ class SaraToolRegistry(
 
     private fun uiActGemini(): JsonObject = buildJsonObject {
         put("name", "ui_act")
-        put("description", "Execute single or batched UI steps on screen: tap_ref, tap_label, tap_xy, long_press_ref, type_text, scroll, swipe, global_action, wait_settle.")
+        put("description", "Execute single or batched UI steps on screen: reply_or_send, tap_ref, tap_label, tap_xy, long_press_ref, type_text, scroll, swipe, global_action, wait_settle.")
         put("parameters", buildJsonObject {
             put("type", "OBJECT")
             put("properties", buildJsonObject {
@@ -369,8 +431,12 @@ class SaraToolRegistry(
                     put("items", buildJsonObject {
                         put("type", "OBJECT")
                         put("properties", buildJsonObject {
-                            put("type", prop("STRING", "tap_ref|tap_label|tap_xy|long_press_ref|type_text|scroll|swipe|global_action|wait_settle"))
+                            put("type", prop("STRING", "reply_or_send|tap_ref|tap_label|tap_xy|long_press_ref|type_text|scroll|swipe|global_action|wait_settle"))
                             put("ref_id", prop("INTEGER", "Node [N]"))
+                            put("reply_to_ref", prop("INTEGER", "Message node [N] to quote-reply to"))
+                            put("reply_to_label", prop("STRING", "Message text/sender to quote-reply to"))
+                            put("input_ref", prop("INTEGER", "Optional input box [N]"))
+                            put("send_ref", prop("INTEGER", "Optional Send button [N]"))
                             put("label", prop("STRING", "Target label"))
                             put("text", prop("STRING", "Text to type"))
                             put("direction", prop("STRING", "up|down|left|right"))

@@ -1,9 +1,11 @@
 package com.voiceagent.tools
 
 import android.util.Log
+import com.voiceagent.accessibility.AppShortcutStore
 import com.voiceagent.accessibility.IdleWaiter
 import com.voiceagent.accessibility.SaraAccessibilityService
 import com.voiceagent.accessibility.ScreenJournal
+import com.voiceagent.accessibility.UiNodeRef
 import com.voiceagent.config.PipelineConfig
 import com.voiceagent.config.asArrOrNull
 import com.voiceagent.config.asBoolOrNull
@@ -24,7 +26,9 @@ data class ToolExecutionOutput(
     val attachedImageMimeType: String = "image/webp"
 )
 
-class ScreenTools {
+class ScreenTools(
+    private val shortcutStore: AppShortcutStore? = null
+) {
     val screenJournal = ScreenJournal()
 
     @Volatile
@@ -164,6 +168,7 @@ class ScreenTools {
 
         var completedCount = 0
         var anyNonWaitStep = false
+        var lastStepWasWaitSettle = false
         for ((idx, step) in steps.withIndex()) {
             currentCoroutineContext().ensureActive()
             val type = step["type"].asStrOrNull()?.trim()?.lowercase().orEmpty()
@@ -255,6 +260,96 @@ class ScreenTools {
                     }
                     true
                 }
+                "reply_or_send" -> {
+                    if (textArg.isBlank()) {
+                        return ToolExecutionOutput(
+                            """{"ok":false,"error":"reply_or_send failed: text is required","completed_steps":$completedCount}"""
+                        )
+                    }
+                    val replyToRefId = step["reply_to_ref"].asIntOrNull()
+                    val replyToLabel = step["reply_to_label"].asStrOrNull()?.trim().orEmpty()
+                    val inputRefId = step["input_ref"].asIntOrNull()
+                    val sendRefId = step["send_ref"].asIntOrNull()
+
+                    var workSnap = currentSnap
+                    var didSwipeReply = false
+                    if (replyToRefId != null || replyToLabel.isNotBlank()) {
+                        val msgNode = when {
+                            replyToRefId != null -> workSnap.nodes.firstOrNull { it.refId == replyToRefId }
+                                ?: if (replyToLabel.isNotBlank()) findNodeByQuery(workSnap.nodes, replyToLabel) else null
+                            else -> findNodeByQuery(workSnap.nodes, replyToLabel)
+                        }
+                        if (msgNode != null) {
+                            svc.swipeMessageToReply(msgNode)
+                            didSwipeReply = true
+                            workSnap = svc.observeTree()
+                        }
+                    }
+
+                    val shortcut = shortcutStore?.get(preStepPkg)
+                    val explicitEditable = if (!didSwipeReply && inputRefId != null) {
+                        workSnap.nodes.firstOrNull { it.refId == inputRefId && it.editable }
+                    } else {
+                        null
+                    }
+                    val editNode: UiNodeRef? = explicitEditable
+                        ?: workSnap.focusedRefId?.let { fId ->
+                            workSnap.nodes.firstOrNull { it.refId == fId && it.editable }
+                        }
+                        ?: shortcut?.inputViewId?.takeIf { it.isNotBlank() }?.let { vid ->
+                            workSnap.nodes.firstOrNull { it.editable && it.viewId.equals(vid, ignoreCase = true) }
+                        }
+                        ?: workSnap.nodes.filter { it.editable }.maxByOrNull { it.cy }
+
+                    var (typed, reason) = svc.typeIntoRef(editNode, textArg, pressEnter = false)
+                    if (!typed) {
+                        workSnap = svc.observeTree()
+                        val retryEdit = workSnap.nodes.firstOrNull { it.editable }
+                        val retryRes = svc.typeIntoRef(retryEdit, textArg, pressEnter = false)
+                        typed = retryRes.first
+                        reason = retryRes.second
+                    }
+                    if (!typed) {
+                        return ToolExecutionOutput(
+                            """{"ok":false,"error":"reply_or_send type failed: $reason","completed_steps":$completedCount}"""
+                        )
+                    }
+
+                    kotlinx.coroutines.delay(90L)
+                    val postTypeSnap = svc.observeTree()
+                    val sendNode = when {
+                        sendRefId != null -> postTypeSnap.nodes.firstOrNull { it.refId == sendRefId }
+                        else -> svc.findSendButtonNode(
+                            snap = postTypeSnap,
+                            editNode = editNode,
+                            preferredViewId = shortcut?.sendViewId.orEmpty(),
+                            preferredLabel = shortcut?.sendLabel.orEmpty()
+                        ) ?: findNodeByQuery(postTypeSnap.nodes, "send")?.takeIf { it.clickable && !it.editable }
+                    }
+                    val sent = if (sendNode != null) {
+                        val tapped = svc.tapOrLongPressRef(sendNode, longPress = false, allowFallbackTap = true)
+                        if (tapped) {
+                            shortcutStore?.recordSendShortcut(
+                                packageName = preStepPkg,
+                                inputViewId = editNode?.viewId,
+                                sendViewId = sendNode.viewId,
+                                sendLabel = sendNode.label,
+                                replyMode = if (replyToRefId != null || replyToLabel.isNotBlank()) "swipe_right" else null
+                            )
+                        }
+                        tapped
+                    } else if (pressEnter) {
+                        svc.typeIntoRef(editNode, textArg, pressEnter = true).first
+                    } else {
+                        false
+                    }
+                    if (!sent) {
+                        return ToolExecutionOutput(
+                            """{"ok":false,"error":"reply_or_send failed: Send button not found after typing","completed_steps":$completedCount,"ui_tree":${kotlinx.serialization.json.JsonPrimitive(postTypeSnap.treeText)}}"""
+                        )
+                    }
+                    true
+                }
                 "scroll" -> svc.scrollDirection(direction, targetNode)
                 "swipe" -> {
                     val x2 = step["x2"].asIntOrNull()
@@ -298,7 +393,7 @@ class ScreenTools {
             // Closed-loop post-step verification & automatic Shizuku kernel input recovery if UI didn't change
             // NEVER double-tap on Keyguard PIN / masked password screens
             if (allowFallbackTap && type in setOf("tap_ref", "tap_label", "tap_xy", "scroll", "swipe")) {
-                delay(240L)
+                delay(140L)
                 val postStepSnap = svc.observeTree()
                 if (postStepSnap.packageName == preStepPkg &&
                     postStepSnap.treeText == preStepTree &&
@@ -325,15 +420,16 @@ class ScreenTools {
                     }
                     if (recovered) {
                         Log.i(PipelineConfig.LOG_TAG, "[ScreenTools] Shizuku fallback input triggered for $type (screen was unchanged)")
-                        delay(260L)
+                        delay(160L)
                         svc.observeTree()
                     }
                 }
-            } else if (idx < steps.size - 1) {
-                delay(240L)
+            } else if (idx < steps.size - 1 && type !in setOf("type_text", "reply_or_send")) {
+                delay(140L)
                 svc.observeTree()
             }
 
+            lastStepWasWaitSettle = (type == "wait_settle")
             completedCount++
             if (type in setOf("tap_ref", "tap_label", "tap_xy")) {
                 val tapSig = "$preStepPkg:${resolvedTapNode?.cx ?: x},${resolvedTapNode?.cy ?: y}:${resolvedTapNode?.label ?: labelQuery}"
@@ -350,7 +446,9 @@ class ScreenTools {
             screenJournal.record(svc.currentPackageName(), "did $type(${resolvedTapNode?.label?.take(24) ?: labelQuery.ifBlank { actionArg }})")
         }
 
-        IdleWaiter.waitForSettle(quietWindowMs = 240L, timeoutMs = 1500L)
+        if (!lastStepWasWaitSettle) {
+            IdleWaiter.waitForSettle(quietWindowMs = 110L, timeoutMs = 450L, structuralOnly = true)
+        }
         val shouldAttachVision = observeAfter || consecutiveSameTapCount >= 2
         var attachedScreenshot: com.voiceagent.accessibility.EncodedSoMScreenshot? = null
         var afterSnap = if (shouldAttachVision) {

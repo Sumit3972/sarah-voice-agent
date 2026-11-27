@@ -15,6 +15,7 @@ import android.view.Display
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import com.voiceagent.audio.VoiceCaptureForegroundService
 import com.voiceagent.config.PipelineConfig
 import com.voiceagent.shizuku.ShizukuBridge
@@ -45,7 +46,7 @@ class SaraAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event != null) {
-            IdleWaiter.onAccessibilityEvent()
+            IdleWaiter.onAccessibilityEvent(event.eventType)
         }
     }
 
@@ -58,6 +59,15 @@ class SaraAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun isImePackage(pkg: String): Boolean {
+        val lower = pkg.lowercase()
+        return lower.contains("inputmethod") ||
+            lower.contains("keyboard") ||
+            lower.contains("gboard") ||
+            lower.contains("honeyboard") ||
+            lower.contains("swiftkey")
+    }
+
     fun currentPackageName(): String {
         val dm = resources.displayMetrics
         val minContentHeight = (dm.heightPixels * 0.20).toInt()
@@ -65,8 +75,9 @@ class SaraAccessibilityService : AccessibilityService() {
         val appWindowPkg = (windows ?: emptyList())
             .asSequence()
             .filter { w ->
+                if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return@filter false
                 val pkg = w.root?.packageName?.toString().orEmpty()
-                if (pkg.isBlank() || pkg == packageName) return@filter false
+                if (pkg.isBlank() || pkg == packageName || isImePackage(pkg)) return@filter false
                 w.getBoundsInScreen(rect)
                 val isThinStatusBar = pkg == "com.android.systemui" && rect.height() < minContentHeight
                 !isThinStatusBar && (pkg != "com.android.systemui" || isDeviceLocked() || w.isFocused || w.isActive)
@@ -76,9 +87,9 @@ class SaraAccessibilityService : AccessibilityService() {
             ?.root?.packageName?.toString()
 
         if (!appWindowPkg.isNullOrBlank()) return appWindowPkg
-        return rootInActiveWindow?.packageName?.toString()
-            ?: lastSnapshot?.packageName
-            ?: "unknown"
+        val rootPkg = rootInActiveWindow?.packageName?.toString()
+        if (!rootPkg.isNullOrBlank() && !isImePackage(rootPkg)) return rootPkg
+        return lastSnapshot?.packageName?.takeIf { !isImePackage(it) } ?: "unknown"
     }
 
     fun observeTree(focusQuery: String? = null): TreeSnapshot {
@@ -333,6 +344,85 @@ class SaraAccessibilityService : AccessibilityService() {
             ShizukuBridge.inputKeyEvent(KeyEvent.KEYCODE_ENTER)
         }
         return ok to if (ok) "typed" else "ACTION_SET_TEXT and ACTION_PASTE failed"
+    }
+
+    /**
+     * Universally triggers quote-reply on a chat message row via right-swipe,
+     * falling back to long-press -> tap "Reply" menu item.
+     */
+    suspend fun swipeMessageToReply(ref: UiNodeRef): Pair<Boolean, String> {
+        val x1 = (ref.bounds.left + 80).coerceAtMost(ref.cx)
+        val x2 = (ref.bounds.left + (ref.bounds.width() * 0.55f).toInt()).coerceAtLeast(x1 + 220)
+        val swiped = swipe(x1, ref.cy, x2, ref.cy, 180L)
+        if (swiped) {
+            delay(180L)
+            val snap = observeTree()
+            val hasReplyCue = snap.nodes.any { it.editable } ||
+                snap.keyboardVisible ||
+                snap.treeText.contains("reply", ignoreCase = true)
+            if (hasReplyCue) {
+                return true to "swipe_right"
+            }
+        }
+
+        val longPressed = tapOrLongPressRef(ref, longPress = true, allowFallbackTap = true)
+        if (longPressed) {
+            delay(220L)
+            val menuSnap = observeTree("reply")
+            val replyItem = menuSnap.nodes.firstOrNull { n ->
+                n.clickable && (n.label.equals("Reply", ignoreCase = true) ||
+                    n.label.lowercase().startsWith("reply "))
+            } ?: menuSnap.nodes.firstOrNull { n ->
+                n.clickable && n.label.equals("Quote", ignoreCase = true)
+            }
+            if (replyItem != null && tapOrLongPressRef(replyItem, longPress = false, allowFallbackTap = true)) {
+                delay(140L)
+                return true to "long_press_reply"
+            }
+        }
+        return false to "reply_gesture_not_confirmed"
+    }
+
+    fun findSendButtonNode(
+        snap: TreeSnapshot,
+        editNode: UiNodeRef?,
+        preferredViewId: String = "",
+        preferredLabel: String = ""
+    ): UiNodeRef? {
+        val clickable = snap.nodes.filter { it.clickable && !it.editable }
+        if (preferredViewId.isNotBlank()) {
+            clickable.firstOrNull { it.viewId.equals(preferredViewId, ignoreCase = true) }?.let { return it }
+        }
+        if (preferredLabel.isNotBlank()) {
+            clickable.firstOrNull { it.label.equals(preferredLabel, ignoreCase = true) }?.let { return it }
+        }
+
+        val ignoreTerms = setOf("attach", "emoji", "sticker", "mic", "voice", "record", "camera", "gallery", "gif")
+        fun isIgnored(n: UiNodeRef): Boolean {
+            val combined = "${n.label} ${n.viewId}".lowercase()
+            return ignoreTerms.any { combined.contains(it) }
+        }
+
+        val explicit = clickable.firstOrNull { n ->
+            if (isIgnored(n)) return@firstOrNull false
+            val lbl = n.label.lowercase()
+            val vid = n.viewId.lowercase()
+            lbl == "send" || lbl == "send message" || lbl == "post" ||
+                vid.contains("send") || vid.contains("chat_send") || vid.contains("btn_send")
+        }
+        if (explicit != null) return explicit
+
+        if (editNode != null) {
+            return clickable
+                .filter { n ->
+                    !isIgnored(n) &&
+                        n.refId != editNode.refId &&
+                        kotlin.math.abs(n.cy - editNode.cy) <= 95 &&
+                        n.cx > editNode.bounds.right - 20
+                }
+                .maxByOrNull { it.cx }
+        }
+        return null
     }
 
     suspend fun performGlobalCommand(action: String): Boolean {

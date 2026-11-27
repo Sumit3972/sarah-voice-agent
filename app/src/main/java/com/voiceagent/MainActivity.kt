@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
     private var pendingMediaState by mutableStateOf<PendingMediaUi?>(null)
     private var pendingCameraUri: Uri? = null
     private var oauthSignInJob: Job? = null
+    private var hasAutoRequestedPermissions = false
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -526,7 +527,8 @@ class MainActivity : ComponentActivity() {
 
         if (hasMic) {
             VoiceCaptureForegroundService.start(this)
-        } else {
+        } else if (!hasAutoRequestedPermissions) {
+            hasAutoRequestedPermissions = true
             requestRuntimePermissionsOnly()
         }
     }
