@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Sarah Voice</string>
+    <string name="accessibility_service_description">Allows Sarah Voice Assistant to inspect on-screen UI elements and perform taps, typing, scrolling, and navigation gestures when you ask her to control apps.</string>
+    <string name="notification_listener_label">Sarah Notification Reader &amp; Quick Reply</string>
+</resources>

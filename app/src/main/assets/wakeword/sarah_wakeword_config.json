@@ -1,0 +1,23 @@
+{
+  "architecture": "BC-ResNet-8",
+  "scale": 1.5,
+  "sample_rate": 16000,
+  "window_samples": 32000,
+  "n_fft": 512,
+  "win_length": 400,
+  "hop_length": 160,
+  "n_mels": 40,
+  "expected_frames": 201,
+  "fmin": 20.0,
+  "fmax": 7600.0,
+  "recommended_threshold": 0.75,
+  "val_metrics": {
+    "threshold": 0.75,
+    "f1": 0.929,
+    "acc": 0.962,
+    "frr": 0.1116,
+    "far": 0.0094
+  },
+  "fp32_size_kb": 283.7,
+  "int8_size_kb": 163.6
+}

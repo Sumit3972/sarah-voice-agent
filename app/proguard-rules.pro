@@ -1,0 +1,2 @@
+-keep class com.voiceagent.** { *; }
+-keep class org.msgpack.** { *; }

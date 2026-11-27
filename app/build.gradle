@@ -1,0 +1,139 @@
+plugins {
+    id 'com.android.application'
+    id 'com.google.devtools.ksp'
+    id 'kotlinx-serialization'
+    id 'org.jetbrains.kotlin.plugin.compose'
+    id 'androidx.room'
+}
+
+def secretsFile = rootProject.file('secrets.properties')
+def secrets = new Properties()
+if (secretsFile.exists()) {
+    secretsFile.withInputStream { secrets.load(it) }
+}
+def sec = { String k, String defVal = '' ->
+    def v = (secrets.getProperty(k) ?: System.getenv(k) ?: defVal).toString()
+    return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
+
+android {
+    namespace = 'com.voiceagent'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.voiceagent"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary = true
+        }
+
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
+
+        buildConfigField "String", "DEEPGRAM_API_KEY", sec("DEEPGRAM_API_KEY")
+        buildConfigField "String", "FISH_AUDIO_API_KEY", sec("FISH_AUDIO_API_KEY")
+        buildConfigField "String", "FISH_AUDIO_BACKUP_KEY", sec("FISH_AUDIO_BACKUP_KEY")
+        buildConfigField "String", "FISH_AUDIO_MODEL", sec("FISH_AUDIO_MODEL", "s2.1-pro-free")
+        buildConfigField "String", "FISH_AUDIO_VOICE_ID", sec("FISH_AUDIO_VOICE_ID", "933563129e564b19a115bedd57b7406a")
+        buildConfigField "String", "INCEPTION_API_KEY", sec("INCEPTION_API_KEY")
+        buildConfigField "String", "INCEPTION_BASE_URL", sec("INCEPTION_BASE_URL", "https://api.inceptionlabs.ai/v1")
+        buildConfigField "String", "INCEPTION_ROUTER_MODEL", sec("INCEPTION_ROUTER_MODEL", "mercury-decide")
+        buildConfigField "String", "INCEPTION_CHAT_MODEL", sec("INCEPTION_CHAT_MODEL", "mercury-3")
+        buildConfigField "String", "ANTIGRAVITY_CLIENT_ID", sec("ANTIGRAVITY_CLIENT_ID")
+        buildConfigField "String", "ANTIGRAVITY_CLIENT_SECRET", sec("ANTIGRAVITY_CLIENT_SECRET")
+        buildConfigField "String", "ANTIGRAVITY_ACCOUNTS_B64", sec("ANTIGRAVITY_ACCOUNTS_B64")
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+
+    packaging {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+        jniLibs {
+            excludes += ['**/x86/*', '**/x86_64/*']
+            pickFirsts += ['**/libonnxruntime.so']
+        }
+    }
+}
+
+kotlin {
+    jvmToolchain(21)
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+        freeCompilerArgs.addAll(
+            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
+        )
+    }
+}
+
+room {
+    schemaDirectory "$projectDir/schemas"
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.18.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-service:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+
+    // Jetpack Compose
+    implementation platform('androidx.compose:compose-bom:2026.06.01')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+
+    // On-Device Neural VAD & Offline BC-ResNet-8 Wake Word (16kHz 16-bit PCM)
+    implementation 'com.github.gkonovalov.android-vad:silero:2.0.10'
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.20.0'
+    implementation 'androidx.browser:browser:1.8.0'
+
+    // Room SQLite + FTS4
+    implementation 'androidx.room:room-runtime:2.8.4'
+    implementation 'androidx.room:room-ktx:2.8.4'
+    ksp 'androidx.room:room-compiler:2.8.4'
+
+    // OkHttp WebSockets/SSE + MessagePack + Serialization
+    implementation platform('com.squareup.okhttp3:okhttp-bom:5.4.0')
+    implementation 'com.squareup.okhttp3:okhttp'
+    implementation 'com.squareup.okhttp3:logging-interceptor'
+    implementation 'org.msgpack:msgpack-core:0.9.8'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+
+    // Privileged System & Multi-App Automation via Shizuku
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0'
+}

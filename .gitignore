@@ -1,0 +1,33 @@
+# Credentials, OAuth & Signing (NEVER commit)
+secrets.properties
+local.properties
+.env
+.env.*
+*.env
+accounts.json
+*accounts*.json
+antigravity_accounts*.json
+credentials*.json
+*secret*.json
+google-services.json
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+
+# Android / Gradle / IDE Build Artifacts
+.gradle/
+.kotlin/
+build/
+app/build/
+.idea/
+*.iml
+captures/
+.cxx/
+*.apk
+*.aab
+__pycache__/
+*.pyc
+*.mpeg
+sarah_wakeword_*_backup.zip

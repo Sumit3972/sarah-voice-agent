@@ -1,0 +1,18 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:9.3.1'
+        classpath 'androidx.room:room-gradle-plugin:2.8.4'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0'
+        classpath 'org.jetbrains.kotlin:kotlin-serialization:2.4.0'
+        classpath 'org.jetbrains.kotlin:compose-compiler-gradle-plugin:2.4.0'
+        classpath 'com.google.devtools.ksp:symbol-processing-gradle-plugin:2.3.10'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

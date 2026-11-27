@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.SarahVoiceAgent" parent="android:Theme.Material.NoActionBar" />
+</resources>
