@@ -1,6 +1,7 @@
 # Credentials, OAuth & Signing (NEVER commit)
 secrets.properties
 local.properties
+keystore.properties
 .env
 .env.*
 *.env

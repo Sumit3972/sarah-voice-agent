@@ -6,19 +6,37 @@ plugins {
     id 'androidx.room'
 }
 
+def isPublicRelease = project.hasProperty('publicRelease') && project.property('publicRelease').toString().toBoolean()
 def secretsFile = rootProject.file('secrets.properties')
 def secrets = new Properties()
-if (secretsFile.exists()) {
+if (!isPublicRelease && secretsFile.exists()) {
     secretsFile.withInputStream { secrets.load(it) }
 }
 def sec = { String k, String defVal = '' ->
-    def v = (secrets.getProperty(k) ?: System.getenv(k) ?: defVal).toString()
+    def v = isPublicRelease ? defVal : (secrets.getProperty(k) ?: System.getenv(k) ?: defVal).toString()
     return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
+
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
 }
 
 android {
     namespace = 'com.voiceagent'
     compileSdk 36
+
+    signingConfigs {
+        if (keystorePropsFile.exists() && file(keystoreProps.getProperty('storeFile', 'release.jks')).exists()) {
+            release {
+                storeFile file(keystoreProps.getProperty('storeFile'))
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            }
+        }
+    }
 
     defaultConfig {
         applicationId "com.voiceagent"
@@ -54,6 +72,10 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            def relSigning = signingConfigs.findByName('release')
+            if (relSigning != null) {
+                signingConfig relSigning
+            }
         }
         debug {
             debuggable true
