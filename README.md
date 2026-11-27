@@ -13,6 +13,11 @@
 [![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-BC--ResNet--8-005CED?style=for-the-badge&logo=onnx&logoColor=white)](https://onnxruntime.ai)
 [![Shizuku](https://img.shields.io/badge/Shizuku-Rootless%20System%20Control-E07A5F?style=for-the-badge)](https://shizuku.rikka.app)
 
+<br /><br />
+
+[![Download Latest APK](https://img.shields.io/badge/Download%20APK-v1.0.0-C0563B?style=for-the-badge&logo=android&logoColor=white)](https://github.com/Sumit3972/sarah-voice-agent/releases/latest/download/sarah-v1.0.0-release.apk)
+[![GitHub Releases](https://img.shields.io/github/v/release/Sumit3972/sarah-voice-agent?style=for-the-badge&color=292420)](https://github.com/Sumit3972/sarah-voice-agent/releases)
+
 </div>
 
 ---
@@ -128,7 +133,7 @@ Sarah includes a built-in OAuth pool manager ([AntigravityOAuthManager.kt](app/s
 
 ### 1. Configure Local Credentials (Never Committed)
 ```powershell
-git clone https://github.com/your-username/sarah-voice-agent.git
+git clone https://github.com/Sumit3972/sarah-voice-agent.git
 cd sarah-voice-agent
 copy secrets.properties.example secrets.properties
 ```
